@@ -70,9 +70,24 @@ def kill_process(process):
             pass
 
 
+def is_region_restricted(text):
+    lower = str(text).lower()
+    return any(s in lower for s in (
+        'not available in your country',
+        'not made this video available in your country',
+        'not available from your location',
+        'not available in your location',
+        'geo-restricted', 'geo restricted', 'geographic restriction',
+    ))
+
+
 def translate_error(text):
     text = re.sub(r'\x1b\[[0-9;]*m', '', str(text))
     lower = text.lower()
+    if is_region_restricted(text):
+        allowed = 'no Brasil' if 'available in brazil' in lower else 'em um país autorizado pela plataforma'
+        return (f'Este vídeo tem restrição de país. O servidor de download precisa estar {allowed}. '
+                'A hospedagem atual não conseguiu acessá-lo. Trocar a qualidade ou usar VPN no seu computador não resolve a localização do servidor.')
     if any(s in lower for s in ('private video', 'login required', 'log in', 'sign in', 'cookies', 'authentication', 'confirm you', 'members-only')):
         return 'A plataforma exige login ou verificação para este vídeo. Esta versão trabalha com vídeos públicos e não importa sua sessão do navegador.'
     if any(s in lower for s in ('drm', 'protected')):
@@ -156,6 +171,8 @@ def run_job(job, request):
         with LOCK:
             if not job['cancel']:
                 job.update(status='error', error=translate_error(error))
+                if is_region_restricted(error):
+                    job['error_code'] = 'region_restricted'
     finally:
         if process and process.poll() is None:
             kill_process(process)

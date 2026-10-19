@@ -1,0 +1,29 @@
+# Deployment template only: no Fly app has been provisioned.
+# Set a unique app name when creating the app; run one Machine in gru.
+primary_region = "gru"
+
+[build]
+  dockerfile = "cloud/Dockerfile"
+
+[env]
+  PORT = "10000"
+  REEL_OUTPUT_DIR = "/tmp/reel"
+
+[http_service]
+  internal_port = 10000
+  force_https = true
+  # Async jobs outlive HTTP requests. Do not stop the VM between polls.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "30s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
