@@ -21,6 +21,8 @@ assert 'bloqueou' in app.translate_error('HTTP Error 403: Forbidden')
 config = tomllib.loads((root / 'fly.toml').read_text())
 assert config['primary_region'] == 'gru'
 assert config['http_service']['auto_stop_machines'] == 'off'
-assert config['http_service']['internal_port'] == 10000
+assert config['http_service']['internal_port'] == 8080
+assert config['env']['PORT'] == '8080'
+assert config['app'] == 'download-arquivos'
 assert config['build']['dockerfile'] == 'cloud/Dockerfile'
 print('PASS Brazil-only error classification, other platform errors and Brazil deployment template')

@@ -1,16 +1,16 @@
-# Deployment template only: no Fly app has been provisioned.
-# Set a unique app name when creating the app; run one Machine in gru.
+# Existing app. Keep one Machine in gru; this file does not relocate old Machines.
+app = "download-arquivos"
 primary_region = "gru"
 
 [build]
   dockerfile = "cloud/Dockerfile"
 
 [env]
-  PORT = "10000"
+  PORT = "8080"
   REEL_OUTPUT_DIR = "/tmp/reel"
 
 [http_service]
-  internal_port = 10000
+  internal_port = 8080
   force_https = true
   # Async jobs outlive HTTP requests. Do not stop the VM between polls.
   auto_stop_machines = "off"
