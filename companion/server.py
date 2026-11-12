@@ -14,6 +14,9 @@ import sys
 import threading
 import time
 import webbrowser
+import math
+import zipfile
+from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -27,6 +30,85 @@ JOBS = {}
 LOCK = threading.RLock()
 MAX_JOBS = 100
 TERMINAL = {'done', 'error', 'cancelled'}
+MAX_BYTES = 500 * 1024 * 1024
+MAX_FRAMES = 5000
+FRAME_RATES = {'1': '1', '2': '2', '5': '1/5', 'all': None}
+
+
+def media_probe(path, probe):
+    result = subprocess.run([str(probe), '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)], capture_output=True, text=True, timeout=45, check=True)
+    return json.loads(result.stdout)
+
+
+def media_duration(info):
+    values = [info.get('format', {}).get('duration')] + [x.get('duration') for x in info.get('streams', [])]
+    return max([float(x) for x in values if x not in (None, 'N/A', '')] or [0])
+
+
+def finalize_media(source, output_format, ffmpeg, probe, expected_duration=0, frame_interval='1'):
+    measured = media_probe(source, probe)
+    streams = measured.get('streams', [])
+    video = next((x for x in streams if x.get('codec_type') == 'video' and not x.get('disposition', {}).get('attached_pic')), None)
+    audio = next((x for x in streams if x.get('codec_type') == 'audio'), None)
+    duration = media_duration(measured)
+    if expected_duration and duration and duration < float(expected_duration) - max(2, float(expected_duration) * .02):
+        raise RuntimeError('O arquivo recebido está incompleto. A duração é menor que a do vídeo da fonte. Tente novamente.')
+    if output_format in ('mp4', 'jpg') and not video:
+        raise RuntimeError('A fonte não forneceu uma faixa de imagem. Este arquivo não será entregue como vídeo.')
+    if output_format in ('mp4', 'mp3') and not audio:
+        raise RuntimeError('A fonte não forneceu uma faixa de áudio. Não é possível entregar o arquivo com som. Você pode escolher JPG para extrair as imagens.')
+    stem = source.stem
+    final = source.with_name(stem + (' - frames.zip' if output_format == 'jpg' else ' - Reel.' + output_format))
+    args = [str(ffmpeg), '-hide_banner', '-nostdin', '-v', 'error', '-xerror', '-y', '-i', str(source)]
+    frames_count = 0
+    if output_format == 'mp4':
+        codec = ['-c:v', 'copy'] if video.get('codec_name') == 'h264' else ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p']
+        args += ['-map', '0:v:0', '-map', '0:a:0', *codec, '-c:a', 'aac', '-b:a', '192k', '-threads', '2', '-movflags', '+faststart', str(final)]
+    elif output_format == 'mp3':
+        args += ['-map', '0:a:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', str(final)]
+    elif output_format == 'jpg':
+        rate = FRAME_RATES[frame_interval]
+        fps = float(Fraction(video.get('avg_frame_rate') or '0/1')) if rate is None else float(Fraction(rate))
+        if duration and duration * fps > MAX_FRAMES:
+            raise RuntimeError('Esta frequência geraria mais de 5.000 frames. Escolha uma frequência menor ou um vídeo mais curto.')
+        folder = source.parent / (source.stem + '-frames')
+        folder.mkdir()
+        if rate is not None:
+            args += ['-vf', 'fps=' + rate]
+        else:
+            args += ['-fps_mode', 'passthrough']
+        args += ['-map', '0:v:0', '-an', '-q:v', '2', '-threads', '2', '-frames:v', str(MAX_FRAMES + 1), str(folder / 'frame_%06d.jpg')]
+    elif output_format == 'original':
+        return source, measured, 0
+    else:
+        raise ValueError('Formato inválido.')
+    try:
+        subprocess.run(args, capture_output=True, text=True, timeout=1800, check=True)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError('A conversão não pôde ser concluída. ' + (error.stderr or '')[-300:]) from error
+    if output_format == 'jpg':
+        frames = sorted(folder.glob('*.jpg'))
+        if not frames or len(frames) > MAX_FRAMES:
+            raise RuntimeError('Não foi possível gerar todos os frames dentro do limite de 5.000 imagens. Escolha uma frequência menor.')
+        frames_count = len(frames)
+        if sum(frame.stat().st_size for frame in frames) > MAX_BYTES:
+            raise RuntimeError('Os frames excederam 500 MB. Escolha uma frequência ou qualidade menor.')
+        with zipfile.ZipFile(final, 'w', compression=zipfile.ZIP_STORED) as archive:
+            for frame in frames:
+                archive.write(frame, 'frames/' + frame.name)
+            archive.writestr('frames/LEIA-ME.txt', f'Frames do vídeo: {stem}\nQuantidade: {frames_count}\nDuração: {duration:.3f}s\nFrequência: {frame_interval} (1 = um por segundo; 2 = dois por segundo; 5 = um a cada 5s; all = todos).\n')
+        return final, measured, frames_count
+    result = media_probe(final, probe)
+    result_streams = result.get('streams', [])
+    if not any(x.get('codec_type') == 'audio' for x in result_streams):
+        raise RuntimeError('A validação final não encontrou áudio no arquivo convertido.')
+    if output_format == 'mp4' and not any(x.get('codec_type') == 'video' for x in result_streams):
+        raise RuntimeError('A validação final não encontrou imagem no MP4.')
+    if duration and media_duration(result) < duration - max(2, duration * .02):
+        raise RuntimeError('A conversão gerou um arquivo incompleto. Tente novamente.')
+    # Decode the entire completed file. Do not deliver a corrupt or truncated MP4/MP3.
+    subprocess.run([str(ffmpeg), '-nostdin', '-v', 'error', '-xerror', '-i', str(final), '-f', 'null', '-'], capture_output=True, timeout=1800, check=True)
+    return final, result, frames_count
 
 
 def validate_url(value):
@@ -99,7 +181,7 @@ def translate_error(text):
     if any(s in lower for s in ('requested format is not available', 'no video formats')):
         return 'Não há um formato de vídeo acessível nesta qualidade. Experimente Original ou outro link.'
     if any(s in lower for s in ('ffmpeg', 'conversion failed', 'postprocessing', 'libpostproc')):
-        return 'Não foi possível finalizar o formato. Tente a opção Original ou execute Atualizar para reparar as dependências.'
+        return 'Não foi possível finalizar ou validar a conversão. Tente novamente ou escolha outro vídeo.'
     if any(s in lower for s in ('timed out', 'connection', 'network', 'resolve')):
         return 'Falha de conexão com a plataforma. Verifique a internet e tente novamente.'
     return ('O download não foi concluído. ' + text.replace('ERROR: ', ''))[:650]
@@ -158,6 +240,8 @@ def run_job(job, request):
             candidate = Path(result['path']).resolve()
             if candidate.parent != work.resolve() or not candidate.is_file():
                 raise RuntimeError('O arquivo final não foi encontrado.')
+            if candidate.stat().st_size > MAX_BYTES:
+                raise RuntimeError('O arquivo final excedeu 500 MB. Escolha uma qualidade ou frequência menor.')
             OUTPUT.mkdir(parents=True, exist_ok=True)
             filename = candidate.name
             final = OUTPUT / filename
@@ -166,7 +250,7 @@ def run_job(job, request):
                 final = OUTPUT / f'{candidate.stem} ({n}){candidate.suffix}'
                 n += 1
             candidate.replace(final)
-            job.update(status='done', percent=100, size=final.stat().st_size, filename=final.name, folder='Downloads/Reel', title=result.get('title') or final.stem, resolution=result.get('resolution') or job.get('resolution', ''))
+            job.update(status='done', percent=100, size=final.stat().st_size, filename=final.name, folder='Downloads/Reel', title=result.get('title') or final.stem, resolution=result.get('resolution') or job.get('resolution', ''), format=result.get('format', request.get('format', 'mp4')), frames_count=result.get('frames_count', 0), duration=result.get('duration', 0))
     except Exception as error:
         with LOCK:
             if not job['cancel']:
@@ -192,6 +276,15 @@ def worker():
     import yt_dlp
     request = json.loads(sys.stdin.readline())
     validate_url(request['url'])
+    # Check every connection as well as the submitted URL, including extractor redirects.
+    import ipaddress
+    original_resolver = socket.getaddrinfo
+    def public_resolver(host, port, *args, **kwargs):
+        answers = original_resolver(host, port, *args, **kwargs)
+        if any(not ipaddress.ip_address(answer[4][0]).is_global for answer in answers):
+            raise ValueError('Use somente endereços públicos da internet.')
+        return answers
+    socket.getaddrinfo = public_resolver
     work = Path(request['work'])
     work.mkdir(parents=True, exist_ok=True)
 
@@ -207,6 +300,7 @@ def worker():
             print(message, file=sys.stderr, flush=True)
 
     # res is min(width,height), so portrait 1080x1920 is correctly treated as 1080p.
+    output_format = request.get('format', 'mp4')
     quality = request.get('quality', 'best')
     sort = ['res' if quality == 'best' else f'res:{quality}', 'fps', 'hdr:12']
     ffmpeg = shutil.which('ffmpeg')
@@ -240,6 +334,8 @@ def worker():
         last[0] = now
         size = data.get('total_bytes') or data.get('total_bytes_estimate') or 0
         got = data.get('downloaded_bytes') or 0
+        if got > MAX_BYTES:
+            raise RuntimeError('O vídeo excede o limite de 500 MB. Escolha uma qualidade menor.')
         fraction = min(1, got / size) if size else 0
         percent = min(99.9, ((parts['index'] - 1 + fraction) / parts['total']) * 100)
         emit(event='progress', status='downloading', percent=percent, size=selected_size[0] or size,
@@ -253,7 +349,8 @@ def worker():
         'logger': Logger(), 'socket_timeout': 20, 'retries': 2, 'fragment_retries': 2,
         'outtmpl': str(work / '%(title).100B [%(id).40B].%(ext)s'),
         'windowsfilenames': True, 'restrictfilenames': False,
-        'format': 'bv*+ba/b', 'format_sort': sort,
+        'format': {'mp3': 'ba/b', 'jpg': 'bv/b'}.get(output_format, 'bv+ba/b'), 'format_sort': sort,
+        'max_filesize': MAX_BYTES, 'hls_use_mpegts': False,
         'ffmpeg_location': ffmpeg, 'progress_hooks': [progress],
         'postprocessor_hooks': [postprocess], 'cachedir': False,
         'allow_unplayable_formats': False,
@@ -265,12 +362,43 @@ def worker():
         opts['js_runtimes'] = {'deno': {}}
     elif shutil.which('node'):
         opts['js_runtimes'] = {'node': {}}
-    if request.get('format') == 'mp4':
-        opts['merge_output_format'] = 'mp4'
-        opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
+    opts['merge_output_format'] = 'mkv'
+    from yt_dlp.extractor.common import InfoExtractor
+    class ReferenceVideoIE(InfoExtractor):
+        IE_NAME = 'ReelReference'
+        _VALID_URL = r'https?://(?:www\.)?(?:cosmos\.so/e/|savee\.(?:it|com)/(?:i|s)/)(?P<id>[\w-]+)'
+        def _real_extract(self, url):
+            video_id = self._match_id(url)
+            page = self._download_webpage(url, video_id)
+            candidates = []
+            meta = self._og_search_video_url(page, secure=False, default=None)
+            if meta:
+                candidates.append(meta)
+            # Only structured VideoObject data for this publication; never recommended cards.
+            for raw in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', page, re.S | re.I):
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    continue
+                nodes = data if isinstance(data, list) else [data]
+                for node in nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    for item in [node, *(node.get('@graph') or [])]:
+                        if isinstance(item, dict) and item.get('@type') == 'VideoObject' and item.get('contentUrl'):
+                            candidates.append(item['contentUrl'])
+            direct = list(dict.fromkeys(x for x in candidates if isinstance(x, str) and re.search(r'\.(?:mp4|webm|mov|m3u8)(?:[?#]|$)', x, re.I)))
+            if not direct:
+                raise yt_dlp.utils.ExtractorError('Não foi encontrado um arquivo público de vídeo neste item. Use o link original da publicação de origem, se disponível.', expected=True)
+            target = validate_url(direct[0])
+            formats = self._extract_m3u8_formats(target, video_id, ext='mp4') if '.m3u8' in urlsplit(target).path else [{'url': target}]
+            return {'id':video_id, 'title':self._og_search_title(page, default=video_id), 'formats':formats, 'http_headers': {'Referer':url}}
+
     try:
         # Keep stdout a strict event stream, including when third-party extractors print.
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(opts, auto_init=False) as ydl:
+            ydl.add_info_extractor(ReferenceVideoIE())
+            ydl.add_default_info_extractors()
             with contextlib.redirect_stdout(sys.stderr):
                 info = ydl.extract_info(request['url'], download=False)
                 if info and info.get('_type') in ('playlist', 'multi_video'):
@@ -279,6 +407,8 @@ def worker():
                         info = ydl.process_ie_result(info, download=False)
             if not info or not (info.get('formats') or info.get('url')):
                 raise RuntimeError('No video formats available')
+            if (info.get('duration') or 0) > 3600:
+                raise RuntimeError('Use um vídeo de até 60 minutos para o processamento online.')
             if info.get('is_live'):
                 raise RuntimeError('Transmissões ao vivo não são suportadas nesta versão. Use um vídeo já publicado.')
             if info.get('has_drm'):
@@ -290,7 +420,7 @@ def worker():
             parts['total'] = max(1, len(streams))
             selected_size[0] = sum(f.get('filesize') or f.get('filesize_approx') or 0 for f in streams)
             w, h = chosen.get('width') or info.get('width'), chosen.get('height') or info.get('height')
-            if quality != 'best' and w and h and min(w, h) > int(quality):
+            if output_format != 'mp3' and quality != 'best' and w and h and min(w, h) > int(quality):
                 raise RuntimeError('Requested format is not available: não há resolução igual ou inferior ao limite selecionado. Tente Original.')
             emit(event='metadata', status='downloading', title=title[0], platform=info.get('extractor_key', ''),
                  resolution=f'{w} × {h}' if w and h else 'Resolução informada pela fonte', size=selected_size[0], percent=0)
@@ -301,19 +431,20 @@ def worker():
             emit = safe_emit
             with contextlib.redirect_stdout(sys.stderr):
                 ydl.process_info(info)
-        candidates = [p for p in work.iterdir() if p.is_file() and p.suffix.lower() in ('.mp4', '.webm', '.mkv', '.mov', '.m4v', '.avi', '.flv', '.ts', '.3gp')]
+        candidates = [p for p in work.iterdir() if p.is_file() and p.suffix.lower() in ('.mp4', '.webm', '.mkv', '.mov', '.m4v', '.avi', '.flv', '.ts', '.3gp', '.m4a', '.mp3', '.opus', '.ogg', '.wav', '.aac')]
         if not candidates:
             raise RuntimeError('Arquivo final não encontrado.')
         final = max(candidates, key=lambda p: p.stat().st_mtime)
         probe = Path(ffmpeg).parent / ('ffprobe.exe' if os.name == 'nt' else 'ffprobe')
         if not probe.exists():
             raise RuntimeError('FFprobe não encontrado. Execute Atualizar para reparar o FFmpeg.')
-        measured = subprocess.run([str(probe), '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json', str(final)], capture_output=True, text=True, timeout=30, check=True)
-        dimensions = json.loads(measured.stdout).get('streams', [{}])[0]
+        emit(event='progress', status='processing', percent=100)
+        final, measured, frames_count = finalize_media(final, output_format, ffmpeg, probe, info.get('duration') or 0, request.get('frame_interval', '1'))
+        dimensions = next((x for x in measured.get('streams', []) if x.get('codec_type') == 'video'), {})
         actual_w, actual_h = dimensions.get('width'), dimensions.get('height')
-        if quality != 'best' and actual_w and actual_h and min(actual_w, actual_h) > int(quality):
-            raise RuntimeError('Requested format is not available: o único arquivo da fonte excede a resolução escolhida. Tente Original.')
-        emit(event='result', path=str(final), title=title[0], resolution=f'{actual_w} × {actual_h}' if actual_w and actual_h else '')
+        if output_format != 'mp3' and quality != 'best' and actual_w and actual_h and min(actual_w, actual_h) > int(quality):
+            raise RuntimeError('Requested format is not available: o arquivo da fonte excede a resolução escolhida. Tente Original.')
+        emit(event='result', path=str(final), title=title[0], resolution=f'{actual_w} × {actual_h}' if actual_w and actual_h else '', format=output_format, frames_count=frames_count, duration=media_duration(measured))
     except Exception as error:
         emit(event='error', error=str(error))
         sys.exit(1)

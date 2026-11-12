@@ -19,6 +19,28 @@ import server as engine
 API_KEY = os.environ.get('REEL_INTERNAL_KEY', '')
 TTL = 3600
 CAPACITY = 20
+PROCESS_SLOT = threading.Semaphore(1)
+
+
+def process_job(job, request):
+    while True:
+        with engine.LOCK:
+            if job.get('cancel'):
+                job['status'] = 'cancelled'
+                return
+            waiting = sorted((x for x in engine.JOBS.values() if x['status'] == 'queued'), key=lambda x:x['created'])
+            if waiting and waiting[0]['id'] == job['id'] and PROCESS_SLOT.acquire(blocking=False):
+                job['status'] = 'analyzing'
+                break
+        time.sleep(.2)
+    try:
+        if job.get('cancel'):
+            job['status'] = 'cancelled'
+            return
+        job['status'] = 'analyzing'
+        engine.run_job(job, request)
+    finally:
+        PROCESS_SLOT.release()
 
 
 def expire():
@@ -55,6 +77,8 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
+        if os.environ.get('FLY_MACHINE_ID'):
+            self.send_header('X-Reel-Instance', os.environ['FLY_MACHINE_ID'])
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
@@ -64,12 +88,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == '/health':
-            return self.reply({'ok': True})
+            return self.reply({'ok': True, 'version': '2.0', 'region': os.environ.get('FLY_REGION', ''), 'formats': ['mp4', 'mp3', 'jpg']})
         if not self.authorized() or not self.owner():
             return self.reply({'error': 'Acesso não autorizado.'}, 403)
         expire()
         if path == '/api/health':
-            return self.reply({'ok': True, 'online': True})
+            return self.reply({'ok': True, 'online': True, 'version': '2.0', 'region': os.environ.get('FLY_REGION', ''), 'formats': ['mp4', 'mp3', 'jpg'], 'frame_intervals': list(engine.FRAME_RATES), 'max_frames': engine.MAX_FRAMES})
         match = re.fullmatch(r'/api/jobs/([a-f0-9]{24})(/file)?', path)
         if not match:
             return self.reply({'error': 'Não encontrado.'}, 404)
@@ -81,6 +105,8 @@ class Handler(BaseHTTPRequestHandler):
             data.pop('owner', None)
             data.pop('filename', None)
             data['folder'] = ''
+            if j['status'] == 'queued':
+                data['queue_position'] = 1 + sum(x['status'] == 'queued' and x['created'] < j['created'] for x in engine.JOBS.values())
             return self.reply(data)
         if j['status'] != 'done' or j.get('cancel'):
             return self.reply({'error': 'O arquivo ainda não está pronto ou foi cancelado.'}, 409)
@@ -98,7 +124,7 @@ class Handler(BaseHTTPRequestHandler):
             if start > end or start >= length:
                 return self.reply({'error': 'Intervalo inválido.'}, 416)
         self.send_response(206 if requested else 200)
-        self.send_header('Content-Type', 'video/mp4' if file.suffix == '.mp4' else 'application/octet-stream')
+        self.send_header('Content-Type', {'.mp4':'video/mp4', '.mp3':'audio/mpeg', '.zip':'application/zip'}.get(file.suffix, 'application/octet-stream'))
         self.send_header('Content-Disposition', "attachment; filename=video" + file.suffix + "; filename*=UTF-8''" + quote(file.name))
         self.send_header('Content-Length', str(end-start+1))
         self.send_header('Accept-Ranges', 'bytes')
@@ -131,22 +157,30 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(count))
             path = urlsplit(self.path).path
             if path == '/api/jobs':
-                if data.get('quality') not in ('best', '1080', '720', '480') or data.get('format') not in ('mp4', 'original'):
+                if data.get('quality') not in ('best', '1080', '720', '480') or data.get('format') not in ('mp4', 'mp3', 'jpg', 'original'):
                     raise ValueError('Selecione qualidade e formato válidos.')
+                if data.get('frame_interval', '1') not in engine.FRAME_RATES:
+                    raise ValueError('Frequência de frames inválida.')
                 url = data.get('url', '')
                 parsed = urlsplit(url)
                 if not parsed.hostname or parsed.scheme not in ('http', 'https') or len(url) > 8192:
                     raise ValueError('Cole um link público válido.')
                 with engine.LOCK:
-                    if any(j['status'] not in engine.TERMINAL for j in engine.JOBS.values()):
-                        return self.reply({'error': 'Já há um vídeo sendo processado. Aguarde ou cancele o download atual.'}, 409)
+                    pending = [j for j in engine.JOBS.values() if j['status'] not in engine.TERMINAL]
+                    if any(j['owner'] == self.owner() for j in pending):
+                        return self.reply({'error': 'Você já tem um download em andamento. Aguarde ou cancele antes de iniciar outro.'}, 409)
+                    if len(pending) >= 8:
+                        return self.reply({'error': 'A fila está cheia. Tente novamente em instantes.'}, 429)
+                    usage = sum(j['created'] > time.time() - 3600 and j['owner'] == self.owner() for j in engine.JOBS.values())
+                    if usage >= 10:
+                        return self.reply({'error': 'Você atingiu 10 solicitações nesta hora. Aguarde para iniciar outras.'}, 429)
                     if len(engine.JOBS) >= CAPACITY:
                         return self.reply({'error': 'O serviço está no limite temporário. Tente novamente mais tarde.'}, 429)
                     jid = secrets.token_hex(12)
-                    j = {'id': jid, 'owner': self.owner(), 'status': 'analyzing', 'percent': 0, 'cancel': False, 'process': None, 'work': str(engine.OUTPUT / '.temporarios' / jid), 'created': time.time()}
+                    j = {'id': jid, 'owner': self.owner(), 'status': 'queued', 'format': data.get('format'), 'percent': 0, 'cancel': False, 'process': None, 'work': str(engine.OUTPUT / '.temporarios' / jid), 'created': time.time()}
                     engine.JOBS[jid] = j
-                    threading.Thread(target=engine.run_job, args=(j, data), daemon=True).start()
-                return self.reply({'id': jid, 'status': 'analyzing'}, 202)
+                    threading.Thread(target=process_job, args=(j, data), daemon=True).start()
+                return self.reply({'id': jid, 'status': j['status']}, 202)
             match = re.fullmatch(r'/api/jobs/([a-f0-9]{24})/cancel', path)
             if match:
                 j = self.job(match.group(1))
