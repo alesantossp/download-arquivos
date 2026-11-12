@@ -15,6 +15,14 @@ with tempfile.TemporaryDirectory() as tmp:
   # Test-only source injection permits this loopback fixture; production stays unchanged.
   source=(root/'companion/server.py').read_text().replace('    socket.getaddrinfo = public_resolver','    pass # test-only loopback fixture')
   code="import sys; sys.path.insert(0,"+repr(str(root/'companion'))+"); namespace={'__name__':'fixture_engine','__file__':"+repr(str(root/'companion/server.py'))+"}; exec("+repr(source)+",namespace); namespace['validate_url']=lambda value:value; namespace['worker']()"
+  inspect_work=p/'metadata'
+  result=subprocess.run([sys.executable,'-c',code],input=json.dumps({'url':f'http://127.0.0.1:{http.server_port}/clip.mp4','quality':'best','format':'mp4','inspect_only':True,'work':str(inspect_work)})+'\n',text=True,capture_output=True,timeout=45)
+  events=[json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
+  metadata=next((x['data'] for x in events if x.get('event')=='inspection'),None)
+  assert result.returncode==0 and metadata,(result.stderr,events)
+  assert metadata['duration']>=2.9 and metadata['size_bytes']>0,metadata
+  assert not list(inspect_work.iterdir()), 'inspection must not leave a downloaded video'
+  print('PASS metadata inspection reads duration/size without starting a job or retaining video')
   for fmt,path in [('mp4','split.mpd'),('mp3','split.mpd'),('jpg','clip.mp4')]:
    work=p/('work-'+fmt)
    result=subprocess.run([sys.executable,'-c',code],input=json.dumps({'url':f'http://127.0.0.1:{http.server_port}/{path}','quality':'best','format':fmt,'frame_interval':'1','work':str(work)})+'\n',text=True,capture_output=True,timeout=90)

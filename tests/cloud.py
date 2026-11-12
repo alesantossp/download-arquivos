@@ -29,5 +29,19 @@ try:
   assert call('/api/jobs/'+jid+'/cancel',data={})[0]==202
   assert not file.exists()
   assert call('/api/jobs/'+jid+'/file')[0]==409
+ # Authenticated preview requests are cached per owner and never create download jobs.
+ calls=[]
+ def inspect(data):calls.append(data);return {'title':'Fixture','duration':65,'size_bytes':1200,'size_kind':'estimated'}
+ app.inspect_video=inspect
+ payload={'url':'https://example.com/video','quality':'720','format':'mp4'}
+ assert call('/api/inspect',token='invalid',data=payload)[0]==403
+ before=len(app.engine.JOBS)
+ for n in range(2):
+  status,body,_=call('/api/inspect',data=payload);assert status==200 and json.loads(body)['duration']==65
+ assert len(calls)==1 and len(app.engine.JOBS)==before
+ assert call('/api/inspect',identity=other,data=payload)[0]==200 and len(calls)==2
+ assert call('/api/inspect',data=dict(payload,url='file:///etc/passwd'))[0]==400
+ assert call('/api/inspect',data=dict(payload,format='invalid'))[0]==400
+ print('PASS inspection authentication, per-owner cache, validation and no download side effects')
  print('PASS private cloud engine authentication, job ownership, byte-range transfer and cancellation cleanup')
 finally:server.shutdown()

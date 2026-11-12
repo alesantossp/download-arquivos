@@ -1,5 +1,8 @@
 """Private online download engine. Access only through the authenticated Site."""
 import hmac
+import subprocess
+import tempfile
+from collections import deque
 import json
 import os
 import re
@@ -20,6 +23,32 @@ API_KEY = os.environ.get('REEL_INTERNAL_KEY', '')
 TTL = 3600
 CAPACITY = 20
 PROCESS_SLOT = threading.Semaphore(1)
+INSPECTION_SLOTS = threading.BoundedSemaphore(2)
+INSPECTION_CACHE = {}
+INSPECTION_RATE = {}
+
+
+def inspect_video(data):
+    with tempfile.TemporaryDirectory(prefix='reel-inspect-') as work:
+        payload = dict(data, work=work, inspect_only=True)
+        process = subprocess.Popen([sys.executable, str(engine.BASE / 'server.py'), '--worker'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            output, errors = process.communicate(json.dumps(payload)+'\n', timeout=35)
+        except subprocess.TimeoutExpired:
+            engine.kill_process(process)
+            process.communicate()
+            raise RuntimeError('A análise demorou mais que o esperado. Tente novamente ou inicie o download.')
+        messages = []
+        for line in output.splitlines():
+            try:
+                message = json.loads(line)
+                if message.get('event') == 'inspection':
+                    return message['data']
+                if message.get('event') == 'error':
+                    messages.append(message.get('error',''))
+            except (ValueError, TypeError):
+                pass
+        raise RuntimeError(engine.translate_error(messages[-1] if messages else errors[-500:]))
 
 
 def process_job(job, request):
@@ -88,12 +117,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == '/health':
-            return self.reply({'ok': True, 'version': '2.0', 'region': os.environ.get('FLY_REGION', ''), 'formats': ['mp4', 'mp3', 'jpg']})
+            return self.reply({'ok': True, 'version': '2.1', 'inspection': True, 'region': os.environ.get('FLY_REGION', ''), 'formats': ['mp4', 'mp3', 'jpg']})
         if not self.authorized() or not self.owner():
             return self.reply({'error': 'Acesso não autorizado.'}, 403)
         expire()
         if path == '/api/health':
-            return self.reply({'ok': True, 'online': True, 'version': '2.0', 'region': os.environ.get('FLY_REGION', ''), 'formats': ['mp4', 'mp3', 'jpg'], 'frame_intervals': list(engine.FRAME_RATES), 'max_frames': engine.MAX_FRAMES})
+            return self.reply({'ok': True, 'online': True, 'version': '2.1', 'inspection': True, 'region': os.environ.get('FLY_REGION', ''), 'formats': ['mp4', 'mp3', 'jpg'], 'frame_intervals': list(engine.FRAME_RATES), 'max_frames': engine.MAX_FRAMES})
         match = re.fullmatch(r'/api/jobs/([a-f0-9]{24})(/file)?', path)
         if not match:
             return self.reply({'error': 'Não encontrado.'}, 404)
@@ -156,6 +185,42 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('Dados inválidos.')
             data = json.loads(self.rfile.read(count))
             path = urlsplit(self.path).path
+            if path == '/api/inspect':
+                if data.get('quality') not in ('best', '1080', '720', '480') or data.get('format') not in ('mp4', 'mp3', 'jpg') or data.get('frame_interval', '1') not in engine.FRAME_RATES:
+                    return self.reply({'error':'Selecione qualidade e formato válidos.'},400)
+                url = data.get('url','')
+                parsed = urlsplit(url)
+                if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username or parsed.password or len(url)>8192:
+                    return self.reply({'error':'Cole um link público completo.'},400)
+                key = (self.owner(), url, data['quality'], data['format'], data.get('frame_interval','1'))
+                now = time.time()
+                with engine.LOCK:
+                    cached = INSPECTION_CACHE.get(key)
+                    if cached and cached[0] > now:
+                        return self.reply(cached[1])
+                    for old_key in list(INSPECTION_CACHE):
+                        if INSPECTION_CACHE[old_key][0] <= now:
+                            INSPECTION_CACHE.pop(old_key,None)
+                    for owner in list(INSPECTION_RATE):
+                        if not INSPECTION_RATE[owner] or INSPECTION_RATE[owner][-1] < now-60:
+                            INSPECTION_RATE.pop(owner,None)
+                    rate = INSPECTION_RATE.setdefault(self.owner(), deque(maxlen=20))
+                    if len(rate)==20 and rate[0]>now-60:
+                        return self.reply({'error':'Muitas análises em sequência. Aguarde um minuto e tente novamente.'},429)
+                    if len(INSPECTION_RATE)>1000 or not INSPECTION_SLOTS.acquire(blocking=False):
+                        return self.reply({'error':'A análise está ocupada. Aguarde alguns segundos e tente novamente.'},429)
+                    rate.append(now)
+                try:
+                    result = inspect_video(data)
+                    with engine.LOCK:
+                        if len(INSPECTION_CACHE)>=128:
+                            INSPECTION_CACHE.pop(next(iter(INSPECTION_CACHE)),None)
+                        INSPECTION_CACHE[key]=(time.time()+300,result)
+                    return self.reply(result)
+                except Exception as error:
+                    return self.reply({'error':str(error)},422)
+                finally:
+                    INSPECTION_SLOTS.release()
             if path == '/api/jobs':
                 if data.get('quality') not in ('best', '1080', '720', '480') or data.get('format') not in ('mp4', 'mp3', 'jpg', 'original'):
                     raise ValueError('Selecione qualidade e formato válidos.')

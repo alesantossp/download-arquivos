@@ -35,6 +35,87 @@ MAX_FRAMES = 5000
 FRAME_RATES = {'1': '1', '2': '2', '5': '1/5', 'all': None}
 
 
+def describe_media(info, output_format='mp4', frame_interval='1'):
+    """Only expose display data, never temporary CDN URLs or request headers."""
+    chosen = dict((info.get('requested_downloads') or [info])[0])
+    if not chosen.get('requested_formats'):
+        for field in ('filesize', 'filesize_approx'):
+            chosen[field] = chosen.get(field) or info.get(field)
+    streams = chosen.get('requested_formats') or [chosen]
+    duration = info.get('duration') or chosen.get('duration')
+    duration = float(duration) if isinstance(duration, (int, float)) and duration > 0 else None
+    sizes = [stream.get('filesize') or stream.get('filesize_approx') for stream in streams]
+    known_sizes = all(isinstance(value, (int, float)) and value > 0 for value in sizes)
+    size = sum(sizes) if known_sizes else None
+    basis = 'reported' if known_sizes and all(stream.get('filesize') for stream in streams) else 'estimated'
+    if not size and duration:
+        rates = [stream.get('tbr') for stream in streams]
+        if all(isinstance(rate, (int, float)) and rate > 0 for rate in rates):
+            size = duration * sum(rates) * 1000 / 8
+    if output_format == 'mp3':
+        size = duration * 192000 / 8 * 1.01 if duration else None
+        basis = 'estimated'
+    elif output_format == 'jpg':
+        size = None
+        basis = 'unknown'
+    else:
+        # Remuxing/re-encoding changes the final MP4 size, even with a known source length.
+        basis = 'estimated' if size else 'unknown'
+    width, height = chosen.get('width') or info.get('width'), chosen.get('height') or info.get('height')
+    return {'title':info.get('title') or 'Vídeo', 'duration':duration, 'size_bytes':round(size) if size else None,
+            'size_kind':basis, 'source_size_bytes':round(sum(sizes)) if known_sizes else None,
+            'resolution':f'{width} × {height}' if width and height and output_format != 'mp3' else None,
+            'format':output_format, 'size_note':('O tamanho do ZIP depende das imagens e da frequência dos frames.' if output_format == 'jpg' else 'Estimativa. O tamanho final pode mudar na conversão.' if size else 'A plataforma não informou o tamanho deste arquivo.')}
+
+
+def inspect_direct_header(info, ydl, work, ffmpeg):
+    """Read at most two 2 MB byte ranges, without creating a downloadable video."""
+    from yt_dlp.networking import Request
+    url = info.get('url') or ''
+    if info.get('duration') or info.get('requested_formats') or not re.search(r'\.(mp4|m4a|mov)(?:$|[?#])', url, re.I):
+        return
+    validate_url(url)
+    part = work / '.metadata.mp4'
+    limit = 2 * 1024 * 1024
+    headers = dict(info.get('http_headers') or {}, Range=f'bytes=0-{limit-1}')
+    try:
+        with ydl.urlopen(Request(url, headers=headers)) as response:
+            head = response.read(limit)
+            content_range = response.headers.get('Content-Range', '')
+            total = int(content_range.rsplit('/',1)[-1]) if content_range and content_range.rsplit('/',1)[-1].isdigit() else int(response.headers.get('Content-Length') or 0)
+        if total:
+            info['filesize'] = total
+        part.write_bytes(head)
+        probe = Path(ffmpeg).parent / ('ffprobe.exe' if os.name == 'nt' else 'ffprobe')
+        def measure():
+            result = subprocess.run([str(probe), '-v', 'quiet', '-show_streams', '-show_format', '-of', 'json', str(part)], capture_output=True, text=True, timeout=5)
+            return json.loads(result.stdout or '{}')
+        result = measure()
+        if not media_duration(result) and len(head) < total <= MAX_BYTES:
+            start = max(len(head), total-limit)
+            with ydl.urlopen(Request(url, headers=dict(info.get('http_headers') or {}, Range=f'bytes={start}-{total-1}'))) as response:
+                if response.status != 206 or not response.headers.get('Content-Range','').startswith(f'bytes {start}-'):
+                    return
+                tail = response.read(limit)
+            with part.open('r+b') as file:
+                file.truncate(total)
+                file.seek(start)
+                file.write(tail)
+            result = measure()
+        duration = media_duration(result)
+        if duration:
+            info['duration'] = duration
+        video = next((stream for stream in result.get('streams',[]) if stream.get('codec_type')=='video'), {})
+        for key in ('width','height'):
+            if video.get(key):
+                info[key] = video[key]
+    except Exception:
+        # A preview is allowed to display "not informed" when a provider hides metadata.
+        pass
+    finally:
+        part.unlink(missing_ok=True)
+
+
 def media_probe(path, probe):
     result = subprocess.run([str(probe), '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)], capture_output=True, text=True, timeout=45, check=True)
     return json.loads(result.stdout)
@@ -346,7 +427,7 @@ def worker():
 
     opts = {
         'noplaylist': True, 'playlist_items': '1', 'quiet': True, 'no_warnings': True,
-        'logger': Logger(), 'socket_timeout': 20, 'retries': 2, 'fragment_retries': 2,
+        'logger': Logger(), 'socket_timeout': 8 if request.get('inspect_only') else 20, 'retries': 2, 'fragment_retries': 2,
         'outtmpl': str(work / '%(title).100B [%(id).40B].%(ext)s'),
         'windowsfilenames': True, 'restrictfilenames': False,
         'format': {'mp3': 'ba/b', 'jpg': 'bv/b'}.get(output_format, 'bv+ba/b'), 'format_sort': sort,
@@ -407,12 +488,16 @@ def worker():
                         info = ydl.process_ie_result(info, download=False)
             if not info or not (info.get('formats') or info.get('url')):
                 raise RuntimeError('No video formats available')
-            if (info.get('duration') or 0) > 3600:
+            if not request.get('inspect_only') and (info.get('duration') or 0) > 3600:
                 raise RuntimeError('Use um vídeo de até 60 minutos para o processamento online.')
             if info.get('is_live'):
                 raise RuntimeError('Transmissões ao vivo não são suportadas nesta versão. Use um vídeo já publicado.')
             if info.get('has_drm'):
                 raise RuntimeError('DRM protected video')
+            if request.get('inspect_only'):
+                inspect_direct_header(info, ydl, work, ffmpeg)
+                emit(event='inspection', data=describe_media(info, output_format, request.get('frame_interval', '1')))
+                return
             title[0] = info.get('title') or 'Vídeo'
             selected = info.get('requested_downloads') or [info]
             chosen = selected[0]
