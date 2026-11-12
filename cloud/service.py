@@ -48,7 +48,9 @@ def inspect_video(data):
                     messages.append(message.get('error',''))
             except (ValueError, TypeError):
                 pass
-        raise RuntimeError(engine.translate_error(messages[-1] if messages else errors[-500:]))
+        original_error = messages[-1] if messages else errors[-500:]
+        print(json.dumps({'event':'inspection_error','error_code':engine.error_code(original_error)}),file=sys.stderr,flush=True)
+        raise RuntimeError(engine.translate_error(original_error))
 
 
 def process_job(job, request):
@@ -117,12 +119,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == '/health':
-            return self.reply({'ok': True, 'version': '2.1', 'inspection': True, 'region': os.environ.get('FLY_REGION', ''), 'formats': ['mp4', 'mp3', 'jpg']})
+            return self.reply({'ok': True, 'version': '2.2', 'inspection': True, 'region': os.environ.get('FLY_REGION', ''), 'formats': ['mp4', 'mp3', 'jpg']})
         if not self.authorized() or not self.owner():
             return self.reply({'error': 'Acesso não autorizado.'}, 403)
         expire()
         if path == '/api/health':
-            return self.reply({'ok': True, 'online': True, 'version': '2.1', 'inspection': True, 'region': os.environ.get('FLY_REGION', ''), 'formats': ['mp4', 'mp3', 'jpg'], 'frame_intervals': list(engine.FRAME_RATES), 'max_frames': engine.MAX_FRAMES})
+            return self.reply({'ok': True, 'online': True, 'version': '2.2', 'inspection': True, 'region': os.environ.get('FLY_REGION', ''), 'formats': ['mp4', 'mp3', 'jpg'], 'frame_intervals': list(engine.FRAME_RATES), 'max_frames': engine.MAX_FRAMES})
         match = re.fullmatch(r'/api/jobs/([a-f0-9]{24})(/file)?', path)
         if not match:
             return self.reply({'error': 'Não encontrado.'}, 404)

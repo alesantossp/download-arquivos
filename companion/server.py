@@ -244,6 +244,21 @@ def is_region_restricted(text):
     ))
 
 
+def error_code(text):
+    lower = str(text).lower()
+    if is_region_restricted(text):
+        return 'region_restricted'
+    if any(value in lower for value in ("confirm you're not a bot", 'confirm you’re not a bot', 'verify you are human', 'captcha', 'bot verification')):
+        return 'verification_required'
+    if any(value in lower for value in ('429', 'too many requests', 'rate-limit', 'rate limit')):
+        return 'rate_limited'
+    if any(value in lower for value in ('private video', 'login required', 'log in', 'sign in', 'authentication', 'members-only', 'age-restricted')):
+        return 'authentication_required'
+    if any(value in lower for value in ('403', 'forbidden', 'blocked')):
+        return 'access_denied'
+    return 'download_failed'
+
+
 def translate_error(text):
     text = re.sub(r'\x1b\[[0-9;]*m', '', str(text))
     lower = text.lower()
@@ -251,7 +266,12 @@ def translate_error(text):
         allowed = 'no Brasil' if 'available in brazil' in lower else 'em um país autorizado pela plataforma'
         return (f'Este vídeo tem restrição de país. O servidor de download precisa estar {allowed}. '
                 'A hospedagem atual não conseguiu acessá-lo. Trocar a qualidade ou usar VPN no seu computador não resolve a localização do servidor.')
-    if any(s in lower for s in ('private video', 'login required', 'log in', 'sign in', 'cookies', 'authentication', 'confirm you', 'members-only')):
+    code = error_code(text)
+    if code == 'verification_required':
+        return 'A plataforma pediu uma verificação à conexão do servidor. Isso não confirma que o vídeo seja privado. O acesso pela sua rede pode funcionar, mas esta tentativa online foi bloqueada.'
+    if code == 'rate_limited':
+        return 'A plataforma limitou as consultas do servidor (HTTP 429 / Too Many Requests). Aguarde antes de tentar novamente. Isso não confirma que o vídeo exija login.'
+    if code == 'authentication_required':
         return 'A plataforma exige login ou verificação para este vídeo. Esta versão trabalha com vídeos públicos e não importa sua sessão do navegador.'
     if any(s in lower for s in ('drm', 'protected')):
         return 'Este vídeo tem proteção que a aplicação não consegue processar.'
@@ -335,7 +355,8 @@ def run_job(job, request):
     except Exception as error:
         with LOCK:
             if not job['cancel']:
-                job.update(status='error', error=translate_error(error))
+                job.update(status='error', error=translate_error(error), error_code=error_code(error))
+                print(json.dumps({'event':'download_error', 'error_code':error_code(error)}),file=sys.stderr,flush=True)
                 if is_region_restricted(error):
                     job['error_code'] = 'region_restricted'
     finally:
